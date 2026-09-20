@@ -1,0 +1,10 @@
+{
+  "name": "ATTENDX — Intelligent Attendance System",
+  "description": "AI-powered classroom attendance platform featuring continuous presence tracking, temporary & prolonged absence detection, and real-time analytics.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
