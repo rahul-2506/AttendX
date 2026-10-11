@@ -1,20 +1,25 @@
 import time
 import datetime
-from typing import Dict, Any, List, Optional, Set
+import asyncio
+from typing import Dict, Any, List, Optional, Set, Union
 from sqlalchemy.orm import Session
-from app.database.models import Student, ClassSession, AttendanceRecord, AttendanceEvent, ClassEnrollment
+from app.config import settings
+from app.database.database import SessionLocal
+from app.database.models import Student, ClassSession, AttendanceRecord, AttendanceEvent, ClassEnrollment, SystemSetting
 from app.websocket.manager import ws_manager
 from app.core.logger import log, metrics
+
 
 def format_duration(seconds: float) -> str:
     mins = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{mins}m {secs:02d}s"
 
+
 class StudentAttendanceState:
     """
     In-memory state for continuous presence monitoring of a single enrolled student.
-    Tracks exact timestamps, accumulated seconds, and state transitions.
+    Tracks exact timestamps, accumulated seconds, state transitions, and override stickiness.
     """
     def __init__(
         self,
@@ -27,69 +32,152 @@ class StudentAttendanceState:
         self.record_id = record_id
         self.roll_number = roll_number
         self.name = name
-        
-        self.status = "NOT_SEEN"  # 'NOT_SEEN', 'PRESENT', 'UNCERTAIN', 'TEMPORARILY_AWAY', 'PROLONGED_ABSENCE', 'RETURNED'
+
+        # States: 'NOT_SEEN', 'PRESENT', 'UNCERTAIN', 'TEMPORARILY_AWAY', 'PROLONGED_ABSENCE', 'RETURNED'
+        self.status = "NOT_SEEN"
         self.first_seen_at: Optional[float] = None
         self.last_seen_at: Optional[float] = None
         self.last_confirmed_at: Optional[float] = None
         self.away_started_at: Optional[float] = None
-        
+
         self.total_present_seconds: float = 0.0
         self.total_away_seconds: float = 0.0
         self.last_tick_at: float = time.time()
-        
+
         self.recognition_count = 0
         self.average_confidence = 95.0
         self.consecutive_unobserved_cycles = 0
-        self.last_logged_status: Optional[str] = None
+
+        # Teacher Override Management
+        self.is_overridden: bool = False
+        self.override_status: Optional[str] = None
+        self.flag_reason: Optional[str] = None
+
+        # Tracking state changes to avoid writing to DB on every frame
+        self.last_persisted_status: str = "NOT_SEEN"
 
 
 class AttendanceEngine:
     """
     Intelligent Time-Based Continuous Classroom Presence State Machine.
-    
-    Receives full-observation cycles from temporal vision tracker and computes exact
-    present/away durations, presence percentages, anti-flicker grace periods, and audit events.
+    Decides student presence over time, accounts for momentary occlusions (anti-flicker),
+    grace periods, prolonged absences, unregistered faces, and teacher overrides.
     """
     def __init__(
         self,
-        uncertain_threshold_seconds: float = 60.0,
-        temporary_absence_threshold_minutes: float = 5.0,
-        prolonged_absence_threshold_minutes: float = 10.0
+        uncertain_threshold_seconds: Optional[float] = None,
+        temporary_absence_threshold_minutes: Optional[float] = None,
+        prolonged_absence_threshold_minutes: Optional[float] = None,
+        present_threshold_percent: Optional[float] = None,
+        partial_threshold_percent: Optional[float] = None
     ):
         self.active_session_id: Optional[str] = None
         self.session_start_time: Optional[float] = None
-        self.session_duration_seconds: float = 3600.0  # default 60 mins
-        
-        self.uncertain_threshold_seconds = uncertain_threshold_seconds
-        self.temporary_absence_threshold_seconds = temporary_absence_threshold_minutes * 60.0
-        self.prolonged_absence_threshold_seconds = prolonged_absence_threshold_minutes * 60.0
-        
-        self.student_states: Dict[str, StudentAttendanceState] = {}
-        self.is_paused = False
-        self.last_unknown_event_time = 0.0
-        self.last_db_sync_time = 0.0
-        self.last_summary_log_time = 0.0
+        self.session_duration_seconds: float = float(settings.DEFAULT_CLASS_DURATION_MINUTES * 60)
 
-    def start_session(self, session_id: str, db: Session):
+        # Configurable thresholds
+        self.uncertain_threshold_seconds: float = (
+            uncertain_threshold_seconds
+            if uncertain_threshold_seconds is not None
+            else float(settings.DEFAULT_UNCERTAIN_THRESHOLD_SECONDS)
+        )
+        self.temporary_absence_threshold_seconds: float = (
+            temporary_absence_threshold_minutes * 60.0
+            if temporary_absence_threshold_minutes is not None
+            else float(settings.DEFAULT_TEMPORARY_ABSENCE_MINUTES * 60)
+        )
+        self.prolonged_absence_threshold_seconds: float = (
+            prolonged_absence_threshold_minutes * 60.0
+            if prolonged_absence_threshold_minutes is not None
+            else float(settings.DEFAULT_PROLONGED_ABSENCE_MINUTES * 60)
+        )
+        self.present_threshold_percent: float = (
+            present_threshold_percent
+            if present_threshold_percent is not None
+            else float(getattr(settings, "DEFAULT_PRESENT_THRESHOLD_PERCENT", 75.0))
+        )
+        self.partial_threshold_percent: float = (
+            partial_threshold_percent
+            if partial_threshold_percent is not None
+            else float(getattr(settings, "DEFAULT_PARTIAL_THRESHOLD_PERCENT", 50.0))
+        )
+
+        self.student_states: Dict[str, StudentAttendanceState] = {}
+        self.is_paused: bool = False
+        self.demo_mode: bool = False
+        self.last_unknown_event_time: float = 0.0
+        self.last_db_sync_time: float = 0.0
+        self.last_summary_log_time: float = 0.0
+
+    def configure_from_settings(self, db: Optional[Session] = None):
         """
-        Initializes attendance state for all students enrolled in this active class session.
+        Dynamically updates thresholds from system settings (DB or config.py).
+        """
+        if db is not None:
+            try:
+                rows = db.query(SystemSetting).all()
+                s_map = {r.key: r.value for r in rows}
+                if "temporary_absence_threshold_minutes" in s_map:
+                    self.temporary_absence_threshold_seconds = float(s_map["temporary_absence_threshold_minutes"]) * 60.0
+                if "prolonged_absence_threshold_minutes" in s_map:
+                    self.prolonged_absence_threshold_seconds = float(s_map["prolonged_absence_threshold_minutes"]) * 60.0
+                if "uncertain_threshold_seconds" in s_map:
+                    self.uncertain_threshold_seconds = float(s_map["uncertain_threshold_seconds"])
+                if "present_threshold_percent" in s_map:
+                    self.present_threshold_percent = float(s_map["present_threshold_percent"])
+            except Exception as e:
+                log.warning("ENGINE", f"Failed to load settings from DB: {e}")
+
+    def set_thresholds(
+        self,
+        uncertain_seconds: Optional[float] = None,
+        temporary_minutes: Optional[float] = None,
+        prolonged_minutes: Optional[float] = None,
+        present_percent: Optional[float] = None
+    ):
+        """
+        Directly sets engine thresholds.
+        """
+        if uncertain_seconds is not None:
+            self.uncertain_threshold_seconds = float(uncertain_seconds)
+        if temporary_minutes is not None:
+            self.temporary_absence_threshold_seconds = float(temporary_minutes * 60.0)
+        if prolonged_minutes is not None:
+            self.prolonged_absence_threshold_seconds = float(prolonged_minutes * 60.0)
+        if present_percent is not None:
+            self.present_threshold_percent = float(present_percent)
+
+    def _broadcast_ws(self, message: dict):
+        """
+        Safe WebSocket broadcast that works across async and sync contexts.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(ws_manager.broadcast(message))
+        except RuntimeError:
+            pass
+
+    def start_session(self, session_id: str, db: Session, start_time: Optional[float] = None):
+        """
+        Initializes attendance state for all students enrolled in this class session.
         """
         self.active_session_id = session_id
-        self.session_start_time = time.time()
+        now = start_time if start_time is not None else time.time()
+        self.session_start_time = now
         self.student_states.clear()
         self.is_paused = False
-        self.last_summary_log_time = time.time()
+        self.last_summary_log_time = now
+
+        self.configure_from_settings(db)
 
         sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
-        class_name = sess.class_course.name if (sess and sess.class_course) else "Unknown Class"
+        class_name = sess.course_name if sess else "Unknown Course"
         class_id = sess.class_id if sess else "N/A"
-        
-        if sess:
+
+        if sess and sess.duration_minutes:
             self.session_duration_seconds = max(60.0, float(sess.duration_minutes * 60))
 
         records = db.query(AttendanceRecord).filter(AttendanceRecord.session_id == session_id).all()
-        now = time.time()
 
         for rec in records:
             student = rec.student
@@ -102,64 +190,336 @@ class AttendanceEngine:
                 roll_number=roll,
                 name=name
             )
-            
-            # Map existing record status
+            state.last_tick_at = now
+
             if rec.status == "present":
                 state.status = "PRESENT"
                 state.first_seen_at = now
                 state.last_seen_at = now
                 state.last_confirmed_at = now
-                state.total_present_seconds = rec.present_duration * 60.0
+                state.total_present_seconds = float(rec.present_duration * 60.0)
+                state.last_persisted_status = "PRESENT"
             elif rec.status == "away":
                 state.status = "TEMPORARILY_AWAY"
-                state.total_away_seconds = rec.away_duration * 60.0
+                state.total_away_seconds = float(rec.away_duration * 60.0)
                 state.away_started_at = now
+                state.last_persisted_status = "TEMPORARILY_AWAY"
             elif rec.status == "prolonged":
                 state.status = "PROLONGED_ABSENCE"
-                state.total_away_seconds = rec.away_duration * 60.0
+                state.total_away_seconds = float(rec.away_duration * 60.0)
                 state.away_started_at = now
+                state.last_persisted_status = "PROLONGED_ABSENCE"
             else:
                 state.status = "NOT_SEEN"
+                state.last_persisted_status = "NOT_SEEN"
 
             self.student_states[rec.student_id] = state
 
-        log.session(f"STARTED | session_id={session_id} | class_id={class_id} | class_name={class_name} | students={len(self.student_states)}")
-        if self.student_states:
-            roster_names = ", ".join([f"{s.name} ({s.roll_number})" for s in self.student_states.values()])
-            log.session(f"ROSTER | enrolled=[{roster_names}]")
+        log.session(f"STARTED | session_id={session_id} | course={class_name} | enrolled={len(self.student_states)}")
 
-    def end_session(self, session_id: str, db: Session):
+    def override_student(
+        self,
+        identifier: str,
+        new_status: str,
+        reason: Optional[str] = None,
+        db: Optional[Session] = None
+    ) -> bool:
         """
-        Freezes calculations and writes final presence percentages and durations to DB.
+        Applies a faculty manual override that takes absolute priority over automatic state degradation.
+        Remains sticky until the session ends.
         """
-        if self.active_session_id == session_id:
-            now = time.time()
-            elapsed_total = now - (self.session_start_time or now)
-            log.session(f"ENDING | session_id={session_id} | duration={format_duration(elapsed_total)}")
+        state = None
+        for s in self.student_states.values():
+            if s.student_id == identifier or s.roll_number == identifier or s.record_id == identifier:
+                state = s
+                break
 
-            sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
-            session_duration = self.session_duration_seconds
+        now = time.time()
+        time_str = datetime.datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+        normalized = new_status.lower()
 
-            log.session("FINAL RESULTS:")
-            for s_id, state in self.student_states.items():
+        if state:
+            state.is_overridden = True
+            state.override_status = normalized
+            if normalized == "present":
+                state.status = "PRESENT"
+                state.away_started_at = None
+                state.flag_reason = None
+                state.last_seen_at = now
+            elif normalized in ["away", "temporarily_away"]:
+                state.status = "TEMPORARILY_AWAY"
+                state.away_started_at = state.away_started_at or now
+                state.flag_reason = reason or "Faculty marked away"
+            elif normalized in ["prolonged", "prolonged_absence"]:
+                state.status = "PROLONGED_ABSENCE"
+                state.away_started_at = state.away_started_at or now
+                state.flag_reason = reason or "Faculty marked prolonged absence"
+            else:
+                state.status = "NOT_SEEN"
+
+            state.last_persisted_status = state.status
+
+            # Broadcast override event
+            self._broadcast_ws({
+                "type": "manual_override",
+                "student_id": state.roll_number,
+                "name": state.name,
+                "status": "present" if state.status == "PRESENT" else ("away" if state.status == "TEMPORARILY_AWAY" else "prolonged"),
+                "reason": state.flag_reason,
+                "presence_percentage": self._calc_presence_pct(state),
+                "timestamp": time_str
+            })
+
+        # Update in database if session provided
+        if db is not None:
+            rec = None
+            if state:
                 rec = db.query(AttendanceRecord).filter(AttendanceRecord.id == state.record_id).first()
-                present_mins = int(state.total_present_seconds / 60.0)
-                away_mins = int(state.total_away_seconds / 60.0)
-                presence_pct = min(100.0, round((state.total_present_seconds / session_duration) * 100.0, 1)) if session_duration > 0 else 0.0
+            if not rec:
+                rec = db.query(AttendanceRecord).filter(
+                    (AttendanceRecord.id == identifier) | (AttendanceRecord.student_id == identifier)
+                ).first()
 
-                if rec:
-                    rec.present_duration = present_mins
-                    rec.away_duration = away_mins
-                    rec.presence_percentage = presence_pct
-                    rec.status = "present" if state.status in ["PRESENT", "RETURNED"] else ("away" if state.status in ["UNCERTAIN", "TEMPORARILY_AWAY"] else ("prolonged" if state.status == "PROLONGED_ABSENCE" else "not_detected"))
-                    rec.currently_present = state.status in ["PRESENT", "RETURNED"]
+            if rec:
+                rec.status = "present" if normalized == "present" else ("away" if normalized in ["away", "temporarily_away"] else "prolonged")
+                rec.currently_present = (normalized == "present")
+                rec.flag_reason = reason or f"Faculty manual override: {normalized}"
 
-                log.session(f"  {state.name} ({state.roll_number}) | present={format_duration(state.total_present_seconds)} | away={format_duration(state.total_away_seconds)} | presence={presence_pct}% | status={state.status}")
+                event = AttendanceEvent(
+                    id=f"evt-ovr-{int(now * 1000)}-{rec.student_id}",
+                    session_id=rec.session_id,
+                    student_id=rec.student_id,
+                    event_type="MANUAL_OVERRIDE",
+                    timestamp=datetime.datetime.utcnow(),
+                    confidence=100.0,
+                    message=f"Manual override: status set to {normalized.upper()}",
+                    badge_text="Override"
+                )
+                db.add(event)
+                db.commit()
+                return True
 
-            db.commit()
-            log.session(f"COMPLETED | session_id={session_id} attendance finalized.")
-            self.active_session_id = None
-            self.student_states.clear()
+        return state is not None
+
+    def update(
+        self,
+        session_id: str,
+        recognized_student_ids: Union[List[str], Set[str]],
+        unknown_face_count: int = 0,
+        now: Optional[float] = None,
+        db: Optional[Session] = None
+    ) -> Dict[str, Any]:
+        """
+        Main per-frame update method.
+        Decides presence over time, handles flicker tolerance, grace periods, and prolonged absences.
+        Only persists to DB and broadcasts when a state change occurs.
+        """
+        if now is None:
+            now = time.time()
+
+        if self.active_session_id != session_id:
+            self.active_session_id = session_id
+            if db:
+                self.start_session(session_id, db, start_time=now)
+
+        close_db_at_end = False
+        if db is None:
+            db = SessionLocal()
+            close_db_at_end = True
+
+        try:
+            recognized_set = {str(sid) for sid in recognized_student_ids} if recognized_student_ids else set()
+            time_str = datetime.datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+
+            # 1. Unknown face detection
+            if unknown_face_count > 0:
+                if (now - self.last_unknown_event_time) >= 5.0:
+                    self.last_unknown_event_time = now
+                    evt = AttendanceEvent(
+                        id=f"evt-unk-{int(now * 1000)}",
+                        session_id=session_id,
+                        student_id=None,
+                        event_type="UNKNOWN_FACE",
+                        timestamp=datetime.datetime.utcnow(),
+                        confidence=75.0,
+                        message=f"{unknown_face_count} unregistered person(s) detected in camera view",
+                        badge_text="Unknown Face"
+                    )
+                    db.add(evt)
+                    db.commit()
+
+                    self._broadcast_ws({
+                        "type": "unknown_face",
+                        "count": unknown_face_count,
+                        "message": "Unregistered person detected in classroom",
+                        "timestamp": time_str
+                    })
+
+            # 2. Process all enrolled students
+            for s_id, state in self.student_states.items():
+                dt = max(0.0, now - state.last_tick_at)
+                state.last_tick_at = now
+
+                # If student is subject to a faculty manual override, override takes precedence
+                if state.is_overridden:
+                    if state.override_status == "present":
+                        state.total_present_seconds += dt
+                        state.last_seen_at = now
+                    else:
+                        state.total_away_seconds += dt
+                    continue
+
+                # Check if student is recognized in this frame
+                is_recognized = (s_id in recognized_set) or (state.roll_number in recognized_set)
+
+                if is_recognized:
+                    state.last_seen_at = now
+                    state.last_confirmed_at = now
+                    state.consecutive_unobserved_cycles = 0
+                    state.recognition_count += 1
+                    state.total_present_seconds += dt
+
+                    prev_status = state.status
+
+                    if prev_status == "NOT_SEEN":
+                        state.status = "PRESENT"
+                        state.first_seen_at = now
+                        state.away_started_at = None
+                        self._handle_state_change(state, "PRESENT", "STUDENT_RECOGNIZED", f"{state.name} ({state.roll_number}) verified present", "Present", db, now, time_str)
+                    elif prev_status in ["TEMPORARILY_AWAY", "PROLONGED_ABSENCE"]:
+                        if state.away_started_at:
+                            state.total_away_seconds += max(0.0, now - state.away_started_at)
+                            state.away_started_at = None
+                        state.status = "PRESENT"
+                        self._handle_state_change(state, "PRESENT", "STUDENT_RETURNED", f"{state.name} ({state.roll_number}) returned to classroom view", "Returned", db, now, time_str)
+                    elif prev_status == "UNCERTAIN":
+                        state.status = "PRESENT"
+                        state.away_started_at = None
+
+                else:
+                    # Student not recognized in current frame
+                    if state.status == "NOT_SEEN" or state.last_seen_at is None:
+                        # Student has not arrived yet
+                        continue
+
+                    state.consecutive_unobserved_cycles += 1
+                    time_since_last_seen = now - state.last_seen_at
+
+                    # State Rule A: unseen 0 - 60s -> UNCERTAIN (anti-flicker: still counted as present)
+                    if time_since_last_seen < self.uncertain_threshold_seconds:
+                        state.status = "UNCERTAIN"
+                        state.total_present_seconds += dt  # Still counted as present during flicker grace window
+                    # State Rule B: unseen between 60s and 5 min -> UNCERTAIN, away duration starts accumulating
+                    elif time_since_last_seen < self.temporary_absence_threshold_seconds:
+                        state.status = "UNCERTAIN"
+                        state.total_away_seconds += dt
+                        if state.away_started_at is None:
+                            state.away_started_at = state.last_seen_at + self.uncertain_threshold_seconds
+                    # State Rule C: unseen over 5 min -> TEMPORARILY_AWAY
+                    elif time_since_last_seen < self.prolonged_absence_threshold_seconds:
+                        state.total_away_seconds += dt
+                        if state.away_started_at is None:
+                            state.away_started_at = state.last_seen_at + self.uncertain_threshold_seconds
+
+                        if state.status != "TEMPORARILY_AWAY":
+                            state.status = "TEMPORARILY_AWAY"
+                            self._handle_state_change(
+                                state,
+                                "TEMPORARILY_AWAY",
+                                "TEMPORARILY_AWAY",
+                                f"{state.name} ({state.roll_number}) stepped away from classroom (> {int(self.temporary_absence_threshold_seconds/60)}m)",
+                                "Away",
+                                db,
+                                now,
+                                time_str
+                            )
+                    # State Rule D: unseen over 10 min -> PROLONGED_ABSENCE
+                    else:
+                        state.total_away_seconds += dt
+                        if state.away_started_at is None:
+                            state.away_started_at = state.last_seen_at + self.uncertain_threshold_seconds
+
+                        if state.status != "PROLONGED_ABSENCE":
+                            state.status = "PROLONGED_ABSENCE"
+                            state.flag_reason = f"Prolonged absence (> {int(self.prolonged_absence_threshold_seconds/60)}m)"
+                            self._handle_state_change(
+                                state,
+                                "PROLONGED_ABSENCE",
+                                "PROLONGED_ABSENCE",
+                                f"Prolonged absence flagged: {state.name} away > {int(self.prolonged_absence_threshold_seconds/60)}m",
+                                "Prolonged Absence",
+                                db,
+                                now,
+                                time_str
+                            )
+
+            return {
+                "session_id": session_id,
+                "timestamp": now,
+                "counts": self.get_attendance_breakdown()
+            }
+
+        finally:
+            if close_db_at_end:
+                db.close()
+
+    def _handle_state_change(
+        self,
+        state: StudentAttendanceState,
+        new_status: str,
+        event_type: str,
+        message: str,
+        badge_text: str,
+        db: Session,
+        now: float,
+        time_str: str
+    ):
+        """
+        Only writes to the DB and broadcasts over WebSocket when a state change occurs.
+        """
+        state.last_persisted_status = new_status
+        db_status = "present" if new_status in ["PRESENT", "RETURNED", "UNCERTAIN"] else ("away" if new_status == "TEMPORARILY_AWAY" else "prolonged")
+
+        # 1. Update AttendanceRecord
+        rec = db.query(AttendanceRecord).filter(AttendanceRecord.id == state.record_id).first()
+        if rec:
+            rec.status = db_status
+            rec.currently_present = (db_status == "present")
+            rec.present_duration = int(state.total_present_seconds / 60.0)
+            rec.away_duration = int(state.total_away_seconds / 60.0)
+            rec.presence_percentage = self._calc_presence_pct(state)
+            rec.flag_reason = state.flag_reason
+            if state.first_seen_at and not rec.first_seen:
+                rec.first_seen = datetime.datetime.fromtimestamp(state.first_seen_at)
+            if state.last_seen_at:
+                rec.last_seen = datetime.datetime.fromtimestamp(state.last_seen_at)
+
+        # 2. Add AttendanceEvent
+        event = AttendanceEvent(
+            id=f"evt-{event_type.lower()}-{int(now * 1000)}-{state.student_id}",
+            session_id=self.active_session_id,
+            student_id=state.student_id,
+            event_type=event_type,
+            timestamp=datetime.datetime.utcnow(),
+            confidence=state.average_confidence,
+            message=message,
+            badge_text=badge_text
+        )
+        db.add(event)
+        db.commit()
+
+        # 3. Real-time WebSocket Broadcast
+        self._broadcast_ws({
+            "type": event_type.lower(),
+            "student_id": state.roll_number,
+            "name": state.name,
+            "status": db_status,
+            "presence_percentage": self._calc_presence_pct(state),
+            "present_duration": int(state.total_present_seconds / 60.0),
+            "away_duration": int(state.total_away_seconds / 60.0),
+            "message": message,
+            "timestamp": time_str
+        })
 
     async def process_observation_cycle(
         self,
@@ -168,317 +528,136 @@ class AttendanceEngine:
         is_camera_healthy: bool = True
     ):
         """
-        Core cycle processor: Receives normalized observations for the active class and updates state machine.
+        Integration adapter for temporal tracker observations.
         """
         if not self.active_session_id:
             return
 
-        now = time.time()
-        time_str = datetime.datetime.now().strftime("%I:%M:%S %p")
-
-        # Camera Disconnect / Error handling
         if not is_camera_healthy:
             if not self.is_paused:
                 self.is_paused = True
-                log.warning("CAMERA", "stream unavailable")
-                log.warning("ATTENDANCE", "evaluation PAUSED | reason=camera_failure")
                 await ws_manager.broadcast({
                     "type": "camera_health",
                     "status": "disconnected",
-                    "message": "Vision pipeline paused. Attendance evaluation suspended."
+                    "message": "Camera stream paused."
                 })
             return
         elif self.is_paused:
             self.is_paused = False
-            log.camera("stream restored")
-            log.attendance("evaluation RESUMED")
             await ws_manager.broadcast({
                 "type": "camera_health",
                 "status": "connected",
-                "message": "Vision pipeline active."
+                "message": "Camera stream restored."
             })
 
-        # Set of confirmed enrolled student IDs in current cycle
-        observed_confirmed_ids: Set[str] = set()
+        confirmed_ids = [
+            obs.get("student_id")
+            for obs in observed_tracks
+            if obs.get("student_id") and obs.get("is_confirmed", False)
+        ]
+        unknown_count = sum(1 for obs in observed_tracks if not obs.get("student_id"))
 
-        for obs in observed_tracks:
-            s_id = obs.get("student_id")
-            if s_id and obs.get("is_confirmed", False):
-                observed_confirmed_ids.add(s_id)
-                await self._handle_student_confirmed(s_id, obs, now, time_str, db)
-            elif not s_id:
-                # Unknown person in frame
-                await self._handle_unknown_face(obs, now, time_str, db)
-
-        # Handle students NOT observed in this cycle
-        for s_id, state in list(self.student_states.items()):
-            if s_id not in observed_confirmed_ids:
-                await self._handle_student_unobserved(state, now, time_str, db)
-
-        # Periodic DB synchronization (every 3 seconds)
-        if now - self.last_db_sync_time > 3.0:
-            self.last_db_sync_time = now
-            self._sync_all_to_db(db)
-
-        # Periodic Attendance Summary log (every 10 seconds)
-        if now - self.last_summary_log_time >= 10.0:
-            self.last_summary_log_time = now
-            self._log_periodic_summary()
-
-    def _log_periodic_summary(self):
-        if not self.student_states:
-            return
-        log.attendance("SUMMARY (10s window):")
-        for state in self.student_states.values():
-            pct = self._calc_presence_pct(state)
-            last_seen_str = datetime.datetime.fromtimestamp(state.last_seen_at).strftime("%H:%M:%S") if state.last_seen_at else "Never"
-            log.attendance(
-                f"  {state.name}: state={state.status} | present={format_duration(state.total_present_seconds)} | "
-                f"away={format_duration(state.total_away_seconds)} | presence={pct}% | last_seen={last_seen_str}"
-            )
-
-    async def _handle_student_confirmed(
-        self,
-        student_id: str,
-        obs: Dict[str, Any],
-        now: float,
-        time_str: str,
-        db: Session
-    ):
-        state = self.student_states.get(student_id)
-        if not state:
-            return  # Student not enrolled in active class
-
-        dt = max(0.0, min(1.0, now - state.last_tick_at))
-        state.last_tick_at = now
-        state.total_present_seconds += dt
-        state.last_seen_at = now
-        state.last_confirmed_at = now
-        state.consecutive_unobserved_cycles = 0
-        state.recognition_count += 1
-        
-        conf = obs.get("identity_confidence", 95.0)
-        state.average_confidence = round(0.9 * state.average_confidence + 0.1 * conf, 1)
-
-        prev_status = state.status
-
-        if prev_status == "NOT_SEEN":
-            # Initial recognition
-            state.status = "PRESENT"
-            state.first_seen_at = now
-            state.away_started_at = None
-
-            time_hms = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
-            log.attendance(f"STATE_CHANGE | student={state.name} | NOT_SEEN \u2192 PRESENT | reason=face_recognized | time={time_hms}")
-
-            # Persist event
-            event = AttendanceEvent(
-                id=f"evt-rec-{int(now * 1000)}-{student_id}",
-                session_id=self.active_session_id,
-                student_id=student_id,
-                event_type="STUDENT_RECOGNIZED",
-                timestamp=datetime.datetime.utcnow(),
-                confidence=conf,
-                message=f"{state.name} ({state.roll_number}) verified present in classroom",
-                badge_text="Present"
-            )
-            db.add(event)
-            db.commit()
-
-            await ws_manager.broadcast({
-                "type": "student_recognized",
-                "student_id": state.roll_number,
-                "name": state.name,
-                "status": "present",
-                "presence_percentage": self._calc_presence_pct(state),
-                "present_duration": int(state.total_present_seconds / 60.0),
-                "away_duration": int(state.total_away_seconds / 60.0),
-                "timestamp": time_str
-            })
-
-        elif prev_status in ["UNCERTAIN", "TEMPORARILY_AWAY", "PROLONGED_ABSENCE"]:
-            # Returned to classroom
-            away_dur = 0.0
-            if state.away_started_at:
-                away_dur = max(0.0, now - state.away_started_at)
-                state.total_away_seconds += away_dur
-                state.away_started_at = None
-
-            state.status = "RETURNED"
-            time_hms = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
-            log.attendance(f"STATE_CHANGE | student={state.name} | {prev_status} \u2192 RETURNED | reason=reidentified | away_duration={away_dur:.1f}s | time={time_hms}")
-
-            event = AttendanceEvent(
-                id=f"evt-ret-{int(now * 1000)}-{student_id}",
-                session_id=self.active_session_id,
-                student_id=student_id,
-                event_type="STUDENT_RETURNED",
-                timestamp=datetime.datetime.utcnow(),
-                confidence=conf,
-                message=f"{state.name} ({state.roll_number}) returned to classroom view",
-                badge_text="Returned"
-            )
-            db.add(event)
-            db.commit()
-
-            await ws_manager.broadcast({
-                "type": "student_returned",
-                "student_id": state.roll_number,
-                "name": state.name,
-                "status": "present",
-                "presence_percentage": self._calc_presence_pct(state),
-                "present_duration": int(state.total_present_seconds / 60.0),
-                "away_duration": int(state.total_away_seconds / 60.0),
-                "message": f"{state.name} returned to class",
-                "timestamp": time_str
-            })
-
-            log.attendance(f"STATE_CHANGE | student={state.name} | RETURNED \u2192 PRESENT")
-            state.status = "PRESENT"
-
-    async def _handle_student_unobserved(
-        self,
-        state: StudentAttendanceState,
-        now: float,
-        time_str: str,
-        db: Session
-    ):
-        if state.status == "NOT_SEEN" or not state.last_seen_at:
-            return  # Student has never entered class
-
-        state.consecutive_unobserved_cycles += 1
-        time_since_last_seen = now - state.last_seen_at
-        time_hms = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
-
-        # 1. Grace Period / UNCERTAIN (0 to 60s)
-        if time_since_last_seen < self.uncertain_threshold_seconds:
-            if state.status == "PRESENT":
-                state.status = "UNCERTAIN"
-                log.attendance(f"STATE_CHANGE | student={state.name} | PRESENT \u2192 UNCERTAIN | reason=track_lost | time={time_hms}")
-            return  # Anti-flicker protection: do not mark absent yet
-
-        # 2. TEMPORARILY_AWAY (1 to 5 mins)
-        if time_since_last_seen < self.prolonged_absence_threshold_seconds:
-            if state.status != "TEMPORARILY_AWAY":
-                prev = state.status
-                state.status = "TEMPORARILY_AWAY"
-                state.away_started_at = state.away_started_at or (now - self.uncertain_threshold_seconds)
-                away_dur = now - state.away_started_at
-                log.attendance(f"STATE_CHANGE | student={state.name} | {prev} \u2192 TEMPORARILY_AWAY | away_duration={away_dur:.1f}s | time={time_hms}")
-
-                event = AttendanceEvent(
-                    id=f"evt-away-{int(now * 1000)}-{state.student_id}",
-                    session_id=self.active_session_id,
-                    student_id=state.student_id,
-                    event_type="TEMPORARILY_AWAY",
-                    timestamp=datetime.datetime.utcnow(),
-                    confidence=None,
-                    message=f"{state.name} ({state.roll_number}) temporarily away from classroom",
-                    badge_text="Away"
-                )
-                db.add(event)
-                db.commit()
-
-                await ws_manager.broadcast({
-                    "type": "student_temporary_absence",
-                    "student_id": state.roll_number,
-                    "name": state.name,
-                    "status": "away",
-                    "presence_percentage": self._calc_presence_pct(state),
-                    "present_duration": int(state.total_present_seconds / 60.0),
-                    "away_duration": int((state.total_away_seconds + (now - state.away_started_at)) / 60.0),
-                    "message": f"{state.name} temporarily away",
-                    "timestamp": time_str
-                })
-
-        # 3. PROLONGED_ABSENCE (> 10 mins)
-        else:
-            if state.status != "PROLONGED_ABSENCE":
-                prev = state.status
-                state.status = "PROLONGED_ABSENCE"
-                state.away_started_at = state.away_started_at or (now - time_since_last_seen)
-                away_dur = now - state.away_started_at
-                log.attendance(f"STATE_CHANGE | student={state.name} | {prev} \u2192 PROLONGED_ABSENCE | away_duration={away_dur:.1f}s | time={time_hms}")
-
-                event = AttendanceEvent(
-                    id=f"evt-prolong-{int(now * 1000)}-{state.student_id}",
-                    session_id=self.active_session_id,
-                    student_id=state.student_id,
-                    event_type="PROLONGED_ABSENCE",
-                    timestamp=datetime.datetime.utcnow(),
-                    confidence=None,
-                    message=f"Prolonged absence flagged: {state.name} away > {int(self.prolonged_absence_threshold_seconds/60)}m",
-                    badge_text="Prolonged Absence"
-                )
-                db.add(event)
-                db.commit()
-
-                await ws_manager.broadcast({
-                    "type": "student_prolonged_absence",
-                    "student_id": state.roll_number,
-                    "name": state.name,
-                    "status": "prolonged",
-                    "presence_percentage": self._calc_presence_pct(state),
-                    "present_duration": int(state.total_present_seconds / 60.0),
-                    "away_duration": int((state.total_away_seconds + (now - state.away_started_at)) / 60.0),
-                    "message": f"Prolonged absence flagged: {state.name} away > {int(self.prolonged_absence_threshold_seconds/60)}m",
-                    "timestamp": time_str
-                })
-
-    async def _handle_unknown_face(
-        self,
-        obs: Dict[str, Any],
-        now: float,
-        time_str: str,
-        db: Session
-    ):
-        # Debounce unknown face events (at most once every 6 seconds)
-        if now - self.last_unknown_event_time < 6.0:
-            return
-        
-        self.last_unknown_event_time = now
-
-        event = AttendanceEvent(
-            id=f"evt-unk-{int(now * 1000)}",
+        self.update(
             session_id=self.active_session_id,
-            student_id=None,
-            event_type="UNKNOWN_FACE",
-            timestamp=datetime.datetime.utcnow(),
-            confidence=obs.get("tracking_confidence", 70.0),
-            message="Unregistered person detected in classroom camera view",
-            badge_text="Unknown Person"
+            recognized_student_ids=confirmed_ids,
+            unknown_face_count=unknown_count,
+            now=time.time(),
+            db=db
         )
-        db.add(event)
+
+    async def run_demo_step(self, db: Session):
+        """
+        Exercises the real attendance engine update loop during demo mode.
+        """
+        if not self.active_session_id or not self.student_states:
+            return
+
+        enrolled_ids = list(self.student_states.keys())
+        if not enrolled_ids:
+            return
+
+        now = time.time()
+        # In demo mode, simulate 80% students present, 1 away, and rare unknown face
+        recognized = enrolled_ids[:max(1, int(len(enrolled_ids) * 0.8))]
+        unknown_count = 1 if (int(now) % 30 == 0) else 0
+
+        self.update(
+            session_id=self.active_session_id,
+            recognized_student_ids=recognized,
+            unknown_face_count=unknown_count,
+            now=now,
+            db=db
+        )
+
+    def end_session(self, session_id: str, db: Session) -> Dict[str, Any]:
+        """
+        Freezes calculations and writes final presence percentages and statuses to DB.
+        Computes final presence_percent = total_present_seconds / session_duration.
+        """
+        sess = db.query(ClassSession).filter(ClassSession.id == session_id).first()
+        session_duration = self.session_duration_seconds
+        if sess and sess.duration_minutes:
+            session_duration = max(60.0, float(sess.duration_minutes * 60))
+
+        results_list = []
+
+        for s_id, state in list(self.student_states.items()):
+            rec = db.query(AttendanceRecord).filter(AttendanceRecord.id == state.record_id).first()
+
+            # Final presence percentage calculation
+            presence_pct = min(100.0, round((state.total_present_seconds / session_duration) * 100.0, 1)) if session_duration > 0 else 0.0
+
+            # Determine final status based on configurable threshold
+            if state.is_overridden and state.override_status:
+                final_status = state.override_status.lower()
+            elif presence_pct >= self.present_threshold_percent:
+                final_status = "present"
+            elif presence_pct >= self.partial_threshold_percent:
+                final_status = "away"
+            else:
+                final_status = "absent" if state.status in ["TEMPORARILY_AWAY", "PROLONGED_ABSENCE", "NOT_SEEN"] else "present"
+
+            present_mins = int(state.total_present_seconds / 60.0)
+            away_mins = int(state.total_away_seconds / 60.0)
+
+            if rec:
+                rec.present_duration = present_mins
+                rec.away_duration = away_mins
+                rec.presence_percentage = presence_pct
+                rec.status = final_status
+                rec.currently_present = (final_status == "present")
+
+            results_list.append({
+                "student_id": state.student_id,
+                "roll_number": state.roll_number,
+                "name": state.name,
+                "status": final_status,
+                "presence_percentage": presence_pct,
+                "present_minutes": present_mins,
+                "away_minutes": away_mins
+            })
+
         db.commit()
 
-        await ws_manager.broadcast({
-            "type": "unknown_face",
-            "message": "Unregistered person detected in classroom",
-            "confidence": round(obs.get("tracking_confidence", 0.7) * 100, 1),
-            "timestamp": time_str
-        })
+        if self.active_session_id == session_id:
+            self.active_session_id = None
+            self.student_states.clear()
+
+        return {
+            "session_id": session_id,
+            "status": "completed",
+            "attendance_records": results_list
+        }
 
     def _calc_presence_pct(self, state: StudentAttendanceState) -> float:
         if self.session_duration_seconds <= 0:
             return 0.0
         return min(100.0, round((state.total_present_seconds / self.session_duration_seconds) * 100.0, 1))
 
-    def _sync_all_to_db(self, db: Session):
-        for s_id, state in self.student_states.items():
-            rec = db.query(AttendanceRecord).filter(AttendanceRecord.id == state.record_id).first()
-            if rec:
-                rec.present_duration = int(state.total_present_seconds / 60.0)
-                rec.away_duration = int(state.total_away_seconds / 60.0)
-                rec.presence_percentage = self._calc_presence_pct(state)
-                rec.status = "present" if state.status in ["PRESENT", "RETURNED", "UNCERTAIN"] else ("away" if state.status == "TEMPORARILY_AWAY" else ("prolonged" if state.status == "PROLONGED_ABSENCE" else "not_detected"))
-                rec.currently_present = state.status in ["PRESENT", "RETURNED", "UNCERTAIN"]
-                rec.confidence = state.average_confidence
-        db.commit()
-
     def get_attendance_breakdown(self) -> Dict[str, int]:
         counts = {"present": 0, "uncertain": 0, "temporarily_away": 0, "prolonged_absence": 0, "not_seen": 0}
         for state in self.student_states.values():
-            if state.status == "PRESENT" or state.status == "RETURNED":
+            if state.status in ["PRESENT", "RETURNED"]:
                 counts["present"] += 1
             elif state.status == "UNCERTAIN":
                 counts["uncertain"] += 1
@@ -489,5 +668,6 @@ class AttendanceEngine:
             else:
                 counts["not_seen"] += 1
         return counts
+
 
 attendance_engine = AttendanceEngine()

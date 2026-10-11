@@ -34,6 +34,7 @@ interface LiveClassroomViewProps {
   onOpenExportModal: () => void;
   onTakeSnapshot: () => void;
   onEndSession: () => void;
+  onOverrideStatus?: (studentId: string, status: any, reason?: string) => Promise<void> | void;
   isPaused: boolean;
   setIsPaused: (paused: boolean) => void;
   isSessionActive: boolean;
@@ -52,6 +53,7 @@ export const LiveClassroomView: React.FC<LiveClassroomViewProps> = ({
   onOpenExportModal,
   onTakeSnapshot,
   onEndSession,
+  onOverrideStatus,
   isPaused,
   setIsPaused,
   isSessionActive,
@@ -231,6 +233,7 @@ export const LiveClassroomView: React.FC<LiveClassroomViewProps> = ({
         students={students}
         onSelectStudent={onSelectStudent}
         onExportCSV={onOpenExportModal}
+        onOverrideStatus={onOverrideStatus}
       />
 
       {/* End Session Confirmation Modal */}

@@ -60,3 +60,46 @@ export const mockAnalyticsData = {
   ],
   departmentBreakdown: [],
 };
+
+export const fallbackClasses = [
+  {
+    id: "CLS-CSE302",
+    name: "Operating Systems",
+    course_code: "CSE302",
+    section: "Section B",
+    room: "AB3-204",
+    color: "#ea5d38",
+    teacher_id: "TCH-001",
+    enrolled_count: 0
+  },
+  {
+    id: "CLS-CSE304",
+    name: "Java Programming",
+    course_code: "CSE304",
+    section: "Section A",
+    room: "AB3-201",
+    color: "#3b82f6",
+    teacher_id: "TCH-001",
+    enrolled_count: 0
+  },
+  {
+    id: "CLS-CSE308",
+    name: "Computer Networks",
+    course_code: "CSE308",
+    section: "Section C",
+    room: "AB3-205",
+    color: "#10b981",
+    teacher_id: "TCH-001",
+    enrolled_count: 0
+  },
+  {
+    id: "CLS-CSE401",
+    name: "Artificial Intelligence & ML",
+    course_code: "CSE401",
+    section: "Section A",
+    room: "AI Lab 1 (AB3-301)",
+    color: "#8b5cf6",
+    teacher_id: "TCH-001",
+    enrolled_count: 0
+  }
+];

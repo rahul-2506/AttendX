@@ -9,6 +9,7 @@ import {
   TodayScheduleData,
   ClassAnalytics
 } from '../types';
+import { fallbackClasses } from '../data/mockData';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
 
@@ -37,23 +38,42 @@ class ApiService {
   // --- Today's Timetable / Schedule ---
   async getTodaySchedule(): Promise<TodayScheduleData> {
     try {
-      return await this.request<TodayScheduleData>('/sessions/today');
+      const data = await this.request<TodayScheduleData>('/sessions/today');
+      if (data && data.classes && data.classes.length > 0) {
+        return data;
+      }
     } catch {
-      return {
-        date_str: new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }),
-        time_str: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        day_name: 'Today',
-        classes: []
-      };
+      // fallback if backend is offline
     }
+    return {
+      date_str: new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }),
+      time_str: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      day_name: 'Today',
+      classes: fallbackClasses.map((c, idx) => ({
+        timetable_id: `tt-${c.id}`,
+        class_id: c.id,
+        course_name: c.name,
+        course_code: c.course_code,
+        section: c.section,
+        room: c.room,
+        color: c.color,
+        start_time: idx === 0 ? '02:00 PM' : (idx === 1 ? '04:00 PM' : (idx === 2 ? '09:00 AM' : '11:00 AM')),
+        end_time: idx === 0 ? '03:00 PM' : (idx === 1 ? '05:00 PM' : (idx === 2 ? '10:00 AM' : '12:00 PM')),
+        enrolled_count: 0,
+        status: 'UPCOMING' as const,
+        status_tag: 'UPCOMING'
+      }))
+    };
   }
 
   // --- Classes Management ---
   async getClasses(): Promise<ClassCourse[]> {
     try {
-      return await this.request<ClassCourse[]>('/classes');
+      const data = await this.request<ClassCourse[]>('/classes');
+      if (data && data.length > 0) return data;
+      return fallbackClasses as any;
     } catch {
-      return [];
+      return fallbackClasses as any;
     }
   }
 

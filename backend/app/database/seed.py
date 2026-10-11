@@ -102,6 +102,24 @@ def seed_database(db: Session):
                 (5, "09:00 AM", "10:00 AM", "AB3-205"),
                 (6, "09:00 AM", "10:00 AM", "AB3-205"),
             ]
+        },
+        {
+            "id": "CLS-CSE401",
+            "name": "Artificial Intelligence & ML",
+            "course_code": "CSE401",
+            "section": "Section A",
+            "room": "AI Lab 1 (AB3-301)",
+            "color": "#8b5cf6",
+            "teacher_id": "TCH-001",
+            "timetable": [
+                (0, "11:00 AM", "12:00 PM", "AI Lab 1 (AB3-301)"),
+                (1, "11:00 AM", "12:00 PM", "AI Lab 1 (AB3-301)"),
+                (2, "02:00 PM", "03:00 PM", "AI Lab 1 (AB3-301)"),
+                (3, "09:00 AM", "10:00 AM", "AI Lab 1 (AB3-301)"),
+                (4, "11:00 AM", "12:00 PM", "AI Lab 1 (AB3-301)"),
+                (5, "11:00 AM", "12:00 PM", "AI Lab 1 (AB3-301)"),
+                (6, "11:00 AM", "12:00 PM", "AI Lab 1 (AB3-301)"),
+            ]
         }
     ]
 

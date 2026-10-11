@@ -187,12 +187,38 @@ export default function App() {
       setActivityEvents(prev => [newEvt, ...prev]);
     });
 
+    const unsubOverride = wsService.on('manual_override', (data) => {
+      setStudents(prev => prev.map(s => {
+        if (s.rollNumber === data.student_id || s.id === data.student_id) {
+          return {
+            ...s,
+            status: data.status,
+            presencePercentage: data.presence_percentage ?? s.presencePercentage,
+            flagReason: data.reason
+          };
+        }
+        return s;
+      }));
+      const newEvt: ActivityEvent = {
+        id: `act-${Date.now()}`,
+        timestamp: data.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        studentName: data.name,
+        studentId: data.student_id,
+        message: `Faculty override: ${data.name || data.student_id} marked ${data.status}`,
+        type: data.status === 'present' ? 'present' : (data.status === 'away' ? 'away' : 'prolonged'),
+        badgeText: 'Override'
+      };
+      setActivityEvents(prev => [newEvt, ...prev]);
+      showToast(`Override applied: ${data.name || data.student_id} is ${data.status}`);
+    });
+
     return () => {
       unsubRecognized();
       unsubReturned();
       unsubAway();
       unsubProlonged();
       unsubUnknown();
+      unsubOverride();
       wsService.disconnect();
     };
   }, [loadActiveSessionData]);
@@ -294,6 +320,17 @@ export default function App() {
     }
   };
 
+  // Faculty Manual Override Handler
+  const handleOverrideStatus = async (studentId: string, status: any, reason?: string) => {
+    try {
+      await apiService.overrideStatus(studentId, status, reason);
+      setStudents(prev => prev.map(s => (s.id === studentId || s.rollNumber === studentId) ? { ...s, status } : s));
+      showToast(`Student status overridden to ${status}`);
+    } catch {
+      showToast('Failed to update student status');
+    }
+  };
+
   const heatmapRows = students.map((s) => ({
     studentId: s.id,
     name: s.name,
@@ -364,6 +401,7 @@ export default function App() {
               onOpenExportModal={() => setShowExportModal(true)}
               onTakeSnapshot={() => apiService.captureSnapshot().then(ts => showToast(`Snapshot saved at ${ts}`))}
               onEndSession={handleEndClassSession}
+              onOverrideStatus={handleOverrideStatus}
               isPaused={isPaused}
               setIsPaused={setIsPaused}
               isSessionActive={isSessionActive}

@@ -38,4 +38,10 @@ def update_settings(payload: SystemSettingsSchema, db: Session = Depends(get_db)
             db.add(SystemSetting(key=k, value=val_str))
 
     db.commit()
+
+    # Inform attendance engine to dynamically adapt thresholds
+    from app.attendance.engine import attendance_engine
+    attendance_engine.configure_from_settings(db)
+    attendance_engine.demo_mode = (payload.camera_source == "demo")
+
     return payload

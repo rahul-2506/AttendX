@@ -28,15 +28,22 @@ def get_live_attendance(db: Session = Depends(get_db)):
 
         results.append({
             "id": student.id,
+            "student_id": student.id,
             "rollNumber": student.roll_number,
+            "roll_number": student.roll_number,
             "name": student.name,
+            "student_name": student.name,
             "avatar": student.avatar or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80",
             "email": student.email or f"{student.roll_number.lower()}@cs.edu",
             "status": r.status,
             "presencePercentage": round(r.presence_percentage, 1),
+            "presence_percentage": round(r.presence_percentage, 1),
             "presentMinutes": r.present_duration,
+            "present_minutes": r.present_duration,
             "awayMinutes": r.away_duration,
+            "away_minutes": r.away_duration,
             "lastSeen": last_seen_str,
+            "last_seen": last_seen_str,
             "confidence": round(r.confidence, 1),
             "enrolledDate": "Aug 2024",
             "department": student.department,
@@ -101,6 +108,7 @@ def get_attendance_events(limit: int = 10, db: Session = Depends(get_db)):
 
 @router.post("/{record_id}/override")
 def override_attendance_status(record_id: str, payload: AttendanceOverrideRequest, db: Session = Depends(get_db)):
+    from app.attendance.engine import attendance_engine
     # Support finding by record_id or student_id
     rec = db.query(AttendanceRecord).filter(AttendanceRecord.id == record_id).first()
     if not rec:
@@ -122,4 +130,13 @@ def override_attendance_status(record_id: str, payload: AttendanceOverrideReques
         rec.flag_reason = payload.reason or "Faculty marked prolonged absence"
 
     db.commit()
+
+    # Inform continuous engine so override sticks until session ends
+    attendance_engine.override_student(
+        identifier=rec.student_id,
+        new_status=payload.status,
+        reason=payload.reason,
+        db=db
+    )
+
     return {"message": "Status updated successfully", "status": rec.status}

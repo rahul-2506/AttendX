@@ -346,8 +346,31 @@ def end_session(session_id: str, db: Session = Depends(get_db)):
     camera_manager.reset_tracker()
     attendance_engine.end_session(session_id, db)
 
+    records = db.query(AttendanceRecord).filter(AttendanceRecord.session_id == session_id).all()
+    records_output = []
+    for r in records:
+        records_output.append({
+            "id": r.id,
+            "student_id": r.student_id,
+            "status": r.status,
+            "presence_percentage": round(r.presence_percentage, 1),
+            "present_minutes": r.present_duration,
+            "away_minutes": r.away_duration,
+            "currently_present": r.currently_present
+        })
+
     return {
         "message": f"Session {session_id} successfully ended and attendance finalized",
         "session_id": session_id,
-        "status": "completed"
+        "status": "completed",
+        "session": {
+            "id": sess.id,
+            "status": sess.status,
+            "duration_minutes": sess.duration_minutes,
+            "course_code": sess.course_code,
+            "course_name": sess.course_name,
+            "start_time": sess.start_time.isoformat() if sess.start_time else None,
+            "end_time": sess.end_time.isoformat() if sess.end_time else None,
+        },
+        "attendance_records": records_output
     }

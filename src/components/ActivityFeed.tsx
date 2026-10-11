@@ -21,36 +21,38 @@ export const ActivityFeed: React.FC<ActivityFeedProps> = ({
   events,
   onSelectEvent,
 }) => {
-  const getEventIcon = (type: ActivityEvent['type']) => {
-    switch (type) {
-      case 'present':
-        return <UserCheck className="w-3.5 h-3.5 text-emerald-400" />;
-      case 'away':
-        return <Clock className="w-3.5 h-3.5 text-amber-400" />;
-      case 'prolonged':
-        return <AlertTriangle className="w-3.5 h-3.5 text-red-400 animate-pulse" />;
-      case 'unknown':
-        return <UserX className="w-3.5 h-3.5 text-purple-400" />;
-      case 'system':
-      default:
-        return <PlayCircle className="w-3.5 h-3.5 text-[#ea5d38]" />;
+  const getEventIcon = (type: string) => {
+    const t = type?.toLowerCase() || '';
+    if (t.includes('prolong')) {
+      return <AlertTriangle className="w-3.5 h-3.5 text-red-400 animate-pulse" />;
     }
+    if (t.includes('present') || t.includes('recognized') || t.includes('returned')) {
+      return <UserCheck className="w-3.5 h-3.5 text-emerald-400" />;
+    }
+    if (t.includes('away')) {
+      return <Clock className="w-3.5 h-3.5 text-amber-400" />;
+    }
+    if (t.includes('unknown')) {
+      return <UserX className="w-3.5 h-3.5 text-purple-400" />;
+    }
+    return <PlayCircle className="w-3.5 h-3.5 text-[#ea5d38]" />;
   };
 
-  const getBadgeStyle = (type: ActivityEvent['type']) => {
-    switch (type) {
-      case 'present':
-        return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
-      case 'away':
-        return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
-      case 'prolonged':
-        return 'bg-red-500/15 text-red-300 border-red-500/30';
-      case 'unknown':
-        return 'bg-purple-500/10 text-purple-400 border-purple-500/20';
-      case 'system':
-      default:
-        return 'bg-white/[0.06] text-gray-300 border-white/[0.08]';
+  const getBadgeStyle = (type: string) => {
+    const t = type?.toLowerCase() || '';
+    if (t.includes('prolong')) {
+      return 'bg-red-500/15 text-red-300 border-red-500/30';
     }
+    if (t.includes('present') || t.includes('recognized') || t.includes('returned')) {
+      return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+    }
+    if (t.includes('away')) {
+      return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+    }
+    if (t.includes('unknown')) {
+      return 'bg-purple-500/10 text-purple-400 border-purple-500/20';
+    }
+    return 'bg-white/[0.06] text-gray-300 border-white/[0.08]';
   };
 
   return (

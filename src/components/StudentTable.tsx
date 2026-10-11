@@ -15,12 +15,14 @@ interface StudentTableProps {
   students: Student[];
   onSelectStudent: (student: Student) => void;
   onExportCSV?: () => void;
+  onOverrideStatus?: (studentId: string, status: AttendanceStatus, reason?: string) => Promise<void> | void;
 }
 
 export const StudentTable: React.FC<StudentTableProps> = ({
   students,
   onSelectStudent,
   onExportCSV,
+  onOverrideStatus,
 }) => {
   const [activeFilter, setActiveFilter] = useState<'all' | 'present' | 'away' | 'prolonged'>('all');
   const [currentPage, setCurrentPage] = useState(1);
@@ -255,27 +257,32 @@ export const StudentTable: React.FC<StudentTableProps> = ({
                   <ArrowUpDown className="w-3 h-3 text-gray-500" />
                 </div>
               </th>
-              <th className="py-3 px-3 w-8 text-right pr-2"></th>
+              <th className="py-3 px-3 font-semibold text-gray-300 text-right pr-3">Actions & Override</th>
             </tr>
           </thead>
 
           <tbody className="divide-y divide-white/[0.04]">
             {paginatedStudents.length === 0 ? (
               <tr>
-                <td colSpan={10} className="py-8 text-center text-xs text-gray-500 font-sans">
+                <td colSpan={11} className="py-8 text-center text-xs text-gray-500 font-sans">
                   No attendance activity recorded yet. Enroll students in the Students tab to start tracking.
                 </td>
               </tr>
             ) : (
               paginatedStudents.map((student) => {
                 const isSelected = selectedIds.includes(student.id);
+                const isProlonged = student.status === 'prolonged';
 
                 return (
                 <tr
                   key={student.id}
                   onClick={() => onSelectStudent(student)}
-                  className={`group hover:bg-white/[0.025] transition-colors cursor-pointer ${
-                    isSelected ? 'bg-white/[0.03]' : ''
+                  className={`group transition-colors cursor-pointer ${
+                    isProlonged
+                      ? 'bg-red-950/20 hover:bg-red-950/30 border-l-4 border-l-red-500'
+                      : isSelected
+                        ? 'bg-white/[0.03] hover:bg-white/[0.04]'
+                        : 'hover:bg-white/[0.025]'
                   }`}
                 >
                   {/* Checkbox */}
@@ -308,7 +315,9 @@ export const StudentTable: React.FC<StudentTableProps> = ({
                         alt={student.name}
                         className="w-6 h-6 rounded-full object-cover border border-white/10"
                       />
-                      <span className="font-semibold text-white group-hover:text-[#f08b70] transition-colors">
+                      <span className={`font-semibold transition-colors ${
+                        isProlonged ? 'text-red-300' : 'text-white group-hover:text-[#f08b70]'
+                      }`}>
                         {student.name}
                       </span>
                     </div>
@@ -351,18 +360,48 @@ export const StudentTable: React.FC<StudentTableProps> = ({
                     {getStatusBadge(student.status)}
                   </td>
 
-                  {/* Menu button */}
+                  {/* Actions & Teacher Override */}
                   <td className="py-3.5 px-3 text-right pr-2">
-                    <button 
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onSelectStudent(student);
-                      }}
-                      className="text-gray-500 hover:text-white p-1 rounded transition-colors"
-                      title="Inspect Student"
-                    >
-                      <MoreVertical className="w-4 h-4" />
-                    </button>
+                    <div className="flex items-center justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
+                      {onOverrideStatus && (
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => onOverrideStatus(student.id, 'present', 'Faculty manual override: present')}
+                            title="Override: Mark Present"
+                            className="px-2 py-0.5 rounded text-[10px] font-medium bg-emerald-500/10 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 transition-colors"
+                          >
+                            Present
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onOverrideStatus(student.id, 'away', 'Faculty manual override: away')}
+                            title="Override: Grant Grace / Mark Away"
+                            className="px-2 py-0.5 rounded text-[10px] font-medium bg-amber-500/10 hover:bg-amber-500/25 text-amber-400 border border-amber-500/30 transition-colors"
+                          >
+                            Away
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onOverrideStatus(student.id, 'prolonged', 'Faculty manual override: prolonged absence')}
+                            title="Override: Flag Prolonged Absence"
+                            className="px-2 py-0.5 rounded text-[10px] font-medium bg-red-500/15 hover:bg-red-500/30 text-red-300 border border-red-500/40 transition-colors"
+                          >
+                            Flag
+                          </button>
+                        </div>
+                      )}
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectStudent(student);
+                        }}
+                        className="text-gray-500 hover:text-white p-1 rounded transition-colors ml-1"
+                        title="Inspect Student"
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );

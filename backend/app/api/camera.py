@@ -102,7 +102,21 @@ async def process_camera_frame(payload: FrameProcessRequest, db: Session = Depen
 
     # 5. Feed complete observation cycle into Attendance Engine State Machine
     try:
-        await attendance_engine.process_observation_cycle(observations, db, is_camera_healthy=True)
+        confirmed_ids = [
+            obs.get("student_id")
+            for obs in observations
+            if obs.get("student_id") and obs.get("is_confirmed", False)
+        ]
+        unknown_count = sum(1 for obs in observations if not obs.get("student_id"))
+        sess_id = active_session.id if active_session else (payload.session_id or "SES-DEFAULT")
+
+        attendance_engine.update(
+            session_id=sess_id,
+            recognized_student_ids=confirmed_ids,
+            unknown_face_count=unknown_count,
+            now=time.time(),
+            db=db
+        )
     except Exception as e:
         print(f"[CameraAPI] Attendance engine cycle error: {e}")
 
@@ -142,4 +156,5 @@ def capture_snapshot(db: Session = Depends(get_db)):
 @router.put("/source")
 def switch_camera_source(payload: CameraSourceUpdateRequest):
     camera_manager.set_source(payload.source_type, payload.config)
+    attendance_engine.demo_mode = (payload.source_type == "demo")
     return {"message": f"Camera source updated to {payload.source_type}"}
